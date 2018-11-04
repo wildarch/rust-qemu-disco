@@ -1,6 +1,6 @@
 target remote :3333
 
-file target/thumbv7em-none-eabi/debug/rust-qemu-disco
+file target/thumbv7em-none-eabi/release/rust-qemu-disco
 load
 
 # print demangled symbols

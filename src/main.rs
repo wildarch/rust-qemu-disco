@@ -85,20 +85,13 @@ impl Task {
                 self.state = TaskState::Running;
             }
             TaskState::Suspended(stack_ptr) => {
-                let hw_frame = (stack_ptr as *const u8)
-                    .offset(core::mem::size_of::<SoftwareStackFrame>() as isize)
-                    as *const ExceptionFrame;
-                let hw_frame = hw_frame.as_ref().unwrap();
-                //let hw_frame = core::ptr::read_volatile(hw_frame);
-                if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-                    writeln!(hstdout, "ExceptionFrame: {:?}", hw_frame);
-                }
                 cortex_m::register::psp::write(stack_ptr as u32);
                 self.state = TaskState::Running;
             }
             TaskState::Running => panic!("Task was left in state Running!"),
         }
-        load_software_frame();
+        cortex_m::asm::dsb();
+        //load_software_frame();
     }
 
     pub fn stack_okay(&self) -> bool {
@@ -107,7 +100,6 @@ impl Task {
     }
 
     pub unsafe fn save_context(&mut self) {
-        save_software_frame();
         let stack_ptr = cortex_m::register::psp::read() as *mut SoftwareStackFrame;
         self.state = TaskState::Suspended(stack_ptr);
         if !self.stack_okay() {
@@ -121,10 +113,8 @@ fn main() -> ! {
     let p = Peripherals::take().unwrap();
     let mut syst = p.SYST;
 
-    // configures the system timer to trigger a SysTick exception every second
     syst.set_clock_source(SystClkSource::Core);
-    //syst.set_reload(16_000_000); // period = 1s
-    syst.set_reload(320_000);
+    syst.set_reload(16_000_000); // period = 1s
     syst.enable_counter();
     syst.enable_interrupt();
 
@@ -135,19 +125,27 @@ fn main() -> ! {
 static mut STDOUT: Option<HStdout> = None;
 
 fn hello_world() -> ! {
+    let mut i: i32 = 0;
     loop {
         if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-            write!(hstdout, ".");
-            cortex_m::asm::delay(1_000_000);
+            writeln!(hstdout, ". {}", i);
+            i += 1;
+            for _ in 0..50 {
+                cortex_m::asm::delay(1_000_000);
+            }
         }
     }
 }
 
 fn hallo_chinees() -> ! {
+    let mut i: i32 = 0;
     loop {
         if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-            write!(hstdout, "O");
-            cortex_m::asm::delay(1_000_000);
+            writeln!(hstdout, "O {}", i);
+            i -= 1;
+            for _ in 0..50 {
+                cortex_m::asm::delay(1_000_000);
+            }
         }
     }
 }
@@ -170,71 +168,80 @@ fn stack_filler() -> ! {
     }
 }
 
-const NROF_TASKS: usize = 1;
-
 #[exception]
 fn SysTick() {
-    static mut TASK_INDEX: usize = 0;
-    static mut TASKS: [Option<Task>; NROF_TASKS] = [None];
-
-    if let Some(ref mut task) = TASKS[*TASK_INDEX % NROF_TASKS] {
-        unsafe { task.save_context() };
-        *TASK_INDEX = *TASK_INDEX + 1;
-    } else {
-        TASKS[0] = Some(Task::new(nothing));
-        //TASKS[1] = Some(Task::new(nothing));
-        //TASKS[2] = Some(Task::new(stack_filler));
-        //TASKS[2] = Some(Task::new(fibonacci_task));
-    }
-
     unsafe {
-        if STDOUT.is_none() {
-            STDOUT = Some(hio::hstdout().unwrap());
+        save_software_frame();
+        cortex_m::asm::dsb();
+        context_switcher();
+        cortex_m::asm::dsb();
+        load_software_frame();
+        if cfg!(debug_assertions) {
+            // Restores the stack to the original state
+            // and jumps to the EXC_RETURN address for User mode PSP.
+            // Note that this is a dangerous tactic, as it assumes a
+            // certain stack size for this function.
+            asm!("
+                 add sp, 16\n\r
+                 bx $0\n\r" :: "r"(EXC_RETURN_THREAD_PSP) :: "volatile")
+        } else {
+            asm!("
+                 add sp, 8\n\r
+                 bx $0\n\r" :: "r"(EXC_RETURN_THREAD_PSP) :: "volatile")
         }
+    };
+}
+
+const NROF_TASKS: usize = 2;
+
+#[inline(never)]
+unsafe fn context_switcher() {
+    static mut TASK_INDEX: usize = 0;
+    static mut TASKS: [Option<Task>; NROF_TASKS] = [None, None];
+
+    if let Some(ref mut task) = TASKS[TASK_INDEX] {
+        if let TaskState::Running = task.state {
+            task.save_context();
+            TASK_INDEX = (TASK_INDEX + 1) % NROF_TASKS;
+        } else {
+            panic!("Task was not running!");
+        }
+    } else {
+        TASKS[0] = Some(Task::new(hallo_chinees));
+        TASKS[1] = Some(Task::new(hello_world));
     }
 
-    if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-        writeln!(hstdout, "Scheduling task {}", *TASK_INDEX);
+    if STDOUT.is_none() {
+        STDOUT = Some(hio::hstdout().unwrap());
+    }
 
-        if let Some(ref mut task) = TASKS[*TASK_INDEX % NROF_TASKS] {
-            unsafe { task.schedule_now() };
-            writeln!(hstdout, "Scheduled!");
+    if let Some(hstdout) = STDOUT.as_mut() {
+        if let Some(ref mut task) = TASKS[TASK_INDEX] {
+            task.schedule_now();
+            writeln!(hstdout, "\nScheduled task: {}", TASK_INDEX);
         } else {
             writeln!(hstdout, "Task does not exist");
         }
     }
-
-    let a = EXC_RETURN_THREAD_PSP;
-    unsafe { asm!("bx $0\n\r" :: "r"(a)) };
 }
 
-/*
 #[exception]
-fn SysTick() {
-    static mut COUNT: usize = 0;
-    unsafe {
-        if STDOUT.is_none() {
-            STDOUT = Some(hio::hstdout().unwrap());
-        }
-    }
-
-    if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-        writeln!(hstdout, "Tick {}!", COUNT);
-        *COUNT += 1;
-    }
+fn DefaultHandler(i: i16) {
+    panic!("Default handler called! ({})", i);
 }
-*/
 
+#[inline(always)]
 unsafe fn save_software_frame() {
     let _tmp: u32;
     asm!("mrs $0, psp \n\t
           stmfd $0!, {r4-r11}\n\r
-          msr psp, $0\n\t" : "=r"(_tmp));
+          msr psp, $0\n\t" : "=r"(_tmp) ::: "volatile");
 }
 
+#[inline(always)]
 unsafe fn load_software_frame() {
     let _tmp: u32;
     asm!("mrs $0, psp \n\t
           ldmfd $0!, {r4-r11}\n\t
-          msr psp, $0\n\t" : "=r"(_tmp));
+          msr psp, $0\n\t" : "=r"(_tmp) ::: "volatile");
 }
