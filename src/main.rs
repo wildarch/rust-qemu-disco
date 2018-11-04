@@ -182,7 +182,7 @@ fn SysTick() {
             // Note that this is a dangerous tactic, as it assumes a
             // certain stack size for this function.
             asm!("
-                 add sp, 16\n\r
+                 add sp, 24\n\r
                  bx $0\n\r" :: "r"(EXC_RETURN_THREAD_PSP) :: "volatile")
         } else {
             asm!("
