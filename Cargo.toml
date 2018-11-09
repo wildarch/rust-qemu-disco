@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 cortex-m = "0.5.7"
-cortex-m-rt = "0.6.3"
+cortex-m-rt = { path = "../cortex-m-rt" }
 cortex-m-semihosting = "0.3.1"
 panic-halt = "0.2.0"
 panic-semihosting = { version = "0.5.1", features = ["exit"] }

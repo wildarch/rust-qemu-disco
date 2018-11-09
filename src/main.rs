@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 #![feature(asm)]
+#![feature(naked_functions)]
 
 extern crate cortex_m;
 extern crate cortex_m_rt;
@@ -11,12 +12,11 @@ use core::fmt::Write;
 
 use cortex_m::peripheral::syst::SystClkSource;
 use cortex_m::Peripherals;
-use cortex_m_rt::{entry, exception, ExceptionFrame};
+use cortex_m_rt::{entry, exception, ExceptionFrame, ExceptionReturn};
 use cortex_m_semihosting::hio::{self, HStdout};
 
 const STACK_SIZE: usize = 1024;
 const PSR_DEFAULT: u32 = 0x2100_0000;
-const EXC_RETURN_THREAD_PSP: u32 = 0xFFFF_FFFD;
 const STACK_CANARY_VALUE: u32 = 0xDEADBEEF;
 
 #[repr(C)]
@@ -91,7 +91,6 @@ impl Task {
             TaskState::Running => panic!("Task was left in state Running!"),
         }
         cortex_m::asm::dsb();
-        //load_software_frame();
     }
 
     pub fn stack_okay(&self) -> bool {
@@ -150,59 +149,20 @@ fn hallo_chinees() -> ! {
     }
 }
 
-fn nothing() -> ! {
-    loop {}
-}
-
-fn stack_filler() -> ! {
-    let mut data = [0u16; STACK_SIZE / 8];
-
-    loop {
-        for (i, entry) in data.iter_mut().enumerate() {
-            *entry = i as u16;
-        }
-        if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
-            write!(hstdout, "{}, ", data[data.len() - 1]);
-            cortex_m::asm::delay(1_000_000);
-        }
-    }
-}
-
-#[exception]
-fn SysTick() {
-    unsafe {
-        save_software_frame();
-        cortex_m::asm::dsb();
-        context_switcher();
-        cortex_m::asm::dsb();
-        load_software_frame();
-        if cfg!(debug_assertions) {
-            // Restores the stack to the original state
-            // and jumps to the EXC_RETURN address for User mode PSP.
-            // Note that this is a dangerous tactic, as it assumes a
-            // certain stack size for this function.
-            asm!("
-                 add sp, 24\n\r
-                 bx $0\n\r" :: "r"(EXC_RETURN_THREAD_PSP) :: "volatile")
-        } else {
-            asm!("
-                 add sp, 8\n\r
-                 bx $0\n\r" :: "r"(EXC_RETURN_THREAD_PSP) :: "volatile")
-        }
-    };
-}
-
 const NROF_TASKS: usize = 2;
 
-#[inline(never)]
-unsafe fn context_switcher() {
+#[exception]
+fn SysTick() -> ExceptionReturn {
     static mut TASK_INDEX: usize = 0;
     static mut TASKS: [Option<Task>; NROF_TASKS] = [None, None];
 
-    if let Some(ref mut task) = TASKS[TASK_INDEX] {
+    unsafe { save_software_frame() };
+    cortex_m::asm::dsb();
+
+    if let Some(ref mut task) = TASKS[*TASK_INDEX] {
         if let TaskState::Running = task.state {
-            task.save_context();
-            TASK_INDEX = (TASK_INDEX + 1) % NROF_TASKS;
+            unsafe { task.save_context() };
+            *TASK_INDEX = (*TASK_INDEX + 1) % NROF_TASKS;
         } else {
             panic!("Task was not running!");
         }
@@ -211,18 +171,24 @@ unsafe fn context_switcher() {
         TASKS[1] = Some(Task::new(hello_world));
     }
 
-    if STDOUT.is_none() {
-        STDOUT = Some(hio::hstdout().unwrap());
+    unsafe {
+        if STDOUT.is_none() {
+            STDOUT = Some(hio::hstdout().unwrap());
+        }
     }
 
-    if let Some(hstdout) = STDOUT.as_mut() {
-        if let Some(ref mut task) = TASKS[TASK_INDEX] {
-            task.schedule_now();
+    if let Some(hstdout) = unsafe { STDOUT.as_mut() } {
+        if let Some(ref mut task) = TASKS[*TASK_INDEX] {
+            unsafe { task.schedule_now() };
             writeln!(hstdout, "\nScheduled task: {}", TASK_INDEX);
         } else {
             writeln!(hstdout, "Task does not exist");
         }
     }
+
+    cortex_m::asm::dsb();
+    unsafe { load_software_frame() };
+    ExceptionReturn::ThreadPsp
 }
 
 #[exception]
@@ -235,7 +201,10 @@ unsafe fn save_software_frame() {
     let _tmp: u32;
     asm!("mrs $0, psp \n\t
           stmfd $0!, {r4-r11}\n\r
-          msr psp, $0\n\t" : "=r"(_tmp) ::: "volatile");
+          msr psp, $0\n\t" : "=r"(_tmp) ::
+              "r4", "r5", "r6", "r7", 
+              "r8", "r9", "r10", "r11"
+              : "volatile");
 }
 
 #[inline(always)]
